@@ -1,0 +1,1190 @@
+﻿// Подключение необходимых библиотек
+#include <SPI.h>           // Для работы с SPI интерфейсом
+#include <WiFi.h>          // Для подключения к WiFi
+#include "time.h"          // Для работы со временем
+#include <Adafruit_GFX.h>  // Графическая библиотека для дисплеев
+#include <Adafruit_ST7735.h> // Драйвер для дисплея ST7735
+#include "DHT.h"           // Для работы с датчиком температуры/влажности DHT11
+#include <ArduinoJson.h>   // Для работы с JSON (погодные данные)
+#include <HTTPClient.h>    // Для HTTP запросов
+#include <WebServer.h>     // Для создания веб-сервера
+#include <Preferences.h>   // Для хранения настроек в энергонезависимой памяти
+#include "FontsRus/FreeMono6.h" // Кириллический шрифт
+
+// Определение серого цвета для дисплея (если не определен в библиотеке)
+#ifndef ST7735_GRAY
+#define ST7735_GRAY 0x7BEF
+#endif
+
+// Определение желтых цветов для дисплея
+#define ST7735_YELLOW_LIGHT  0xFFE0  // Светло-желтый
+#define ST7735_YELLOW_DARK   0xFD20  // Темно-желтый  
+#define ST7735_YELLOW_ORANGE 0xFE60  // Оранжево-желтый
+#define ST7735_YELLOW_GOLD   0xFEA0  // Золотой
+
+// Цвета для иконок погоды
+#define WEATHER_WHITE        0xFFFF  // Белый
+#define WEATHER_LIGHT_GRAY   0xC618  // Светло-серый
+#define WEATHER_BLUE         0x001F  // Синий
+#define WEATHER_DARK_GRAY    0x7BEF  // Темно-серый
+
+// Данные для подключения к WiFi сети
+char ssid[] = "emae";                     // SSID сети WiFi
+char password[] = "ekmakarekblin2007";    // Пароль сети WiFi
+
+// Настройки NTP серверов для получения времени
+const char *ntpServer1 = "pool.ntp.org";  // Первый NTP сервер
+const char *ntpServer2 = "time.nist.gov"; // Второй NTP сервер
+const long gmtOffset_sec = 7 * 3600;      // Смещение временной зоны (+7 часов)
+const int daylightOffset_sec = 0;         // Смещение летнего времени (0 - не используется)
+
+// Определение пинов для дисплея ST7735
+#define TFT_CS     5    // Пин выбора чипа (Chip Select)
+#define TFT_RST    17   // Пин сброса (Reset)
+#define TFT_DC     16   // Пин выбора данных/команд (Data/Command)
+#define TFT_MOSI   23   // Пин MOSI (Master Out Slave In)
+#define TFT_SCLK   18   // Пин тактового сигнала (Serial Clock)
+
+// Создание объекта дисплея
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
+
+// Определение пина и типа датчика DHT
+#define DHTPIN 4          // Пин, к которому подключен датчик DHT
+#define DHTTYPE DHT11     // Тип датчика - DHT11
+DHT dht(DHTPIN, DHTTYPE); // Создание объекта датчика
+
+// Определение пина для зуммера (будильник)
+#define BUZZER_PIN 25
+
+// Переменные для отслеживания предыдущих значений времени
+int lastHour = -1;  // Последний отображенный час
+int lastMin = -1;   // Последняя отображенная минута
+int lastSec = -1;   // Последняя отображенная секунда
+int lastDay = -1;   // Последний отображенный день
+float lastTemp = -100; // Последняя отображенная температура
+float lastHum = -1;    // Последняя отображенная влажность
+
+// URL для получения погодных данных с API weatherapi.com
+const String weatherURL = "http://api.weatherapi.com/v1/current.json?key=cfedf5fc0a944339aed40642252711&q=Novosibirsk";
+
+// Структура для хранения погодных данных
+struct WeatherData {
+  float temperature;  // Температура
+  String condition;   // Состояние погоды (ясно, облачно и т.д.)
+  bool valid = false; // Флаг валидности данных
+};
+
+// Переменные для работы с погодными данными
+WeatherData lastWeather;                    // Последние полученные погодные данные
+unsigned long lastWeatherUpdate = 0;        // Время последнего обновления погоды
+const unsigned long WEATHER_UPDATE_INTERVAL = 600000; // Интервал обновления погоды (10 минут)
+
+// Переменные для управления переключением экранов
+unsigned long lastSwitch = 0;               // Время последнего переключения экрана
+const unsigned long SCREEN_DURATION = 10000; // Длительность показа одного экрана (10 секунд)
+int currentScreen = 0;                      // Текущий отображаемый экран (0-время, 1-температура, 2-погода)
+int prevScreen = -1;                        // Предыдущий экран
+
+// Координаты для отображения времени на дисплее
+int16_t hourTensX, hourOnesX, minTensX, minOnesX, secTensX, secOnesX; // X координаты цифр
+int16_t colon1X, colon2X;  // X координаты двоеточий
+int16_t timeY;             // Y координата времени
+uint16_t digitW, digitH;   // Ширина и высота цифры
+uint16_t colonW;           // Ширина двоеточия
+
+// Координаты для отображения температуры и влажности
+int16_t tempIntX, tempDec1X, tempDotX, tempDec2X, tempCX;        // X координаты для температуры
+int16_t humIntX1, humIntX2, humDotX, humDecX, humPercentX;       // X координаты для влажности
+int16_t tempY = 40, humY = 90;                                   // Y координаты (разделены по вертикали)
+uint16_t tempDigitW, tempDigitH;  // Размеры цифр температуры
+uint16_t humDigitW, humDigitH;    // Размеры цифр влажности
+uint16_t dotW, percentW;          // Размеры точек и знака процента
+
+// Для плавного обновления влажности
+unsigned long lastHumUpdate = 0;                 // Время последнего обновления влажности
+const unsigned long HUM_UPDATE_INTERVAL = 2000;  // Интервал обновления влажности (2 секунды)
+float currentHum = 0;                            // Текущее значение влажности для плавного обновления
+
+// Переменные для отслеживания состояния экранов
+String lastWeatherCondition = "";     // Последнее отображенное состояние погоды
+float lastShownWeatherTemp = -100;   // Последняя отображенная температура погоды
+
+// Флаги инициализации экранов
+bool timeScreenInitialized = false;     // Флаг инициализации экрана времени
+bool tempScreenInitialized = false;     // Флаг инициализации экрана температуры
+bool weatherScreenInitialized = false;  // Флаг инициализации экрана погоды
+
+// Объекты для веб-сервера и хранения настроек
+WebServer server(80);      // Веб-сервер на порту 80
+Preferences prefs;         // Для хранения настроек в энергонезависимой памяти
+
+// Переменные для работы с будильником
+int alarmHour = 20;          // Час срабатывания будильника (по умолчанию 20:00)
+int alarmMinute = 30;        // Минута срабатывания будильника (по умолчанию 20:30)
+int alarmDuration = 7;       // Длительность будильника в секундах (по умолчанию 7)
+bool alarmEnabled = true;    // Флаг включения/выключения будильника
+bool alarmTriggered = false; // Флаг срабатывания будильника
+bool isBuzzerActive = false; // Флаг активности зуммера
+unsigned long buzzerStartTime = 0; // Время начала работы зуммера
+unsigned long alarmDisplayStart = 0; // Время начала отображения уведомления о будильнике
+bool showingAlarm = false;   // Флаг отображения уведомления о будильнике
+
+// Мелодия будильника (ноты в герцах)
+const int ALARM_MELODY[] = {523, 587, 659, 698, 784, 880, 988, 1047};
+const int MELODY_LENGTH = 8;    // Длина мелодии
+int melodyIndex = 0;            // Текущий индекс ноты в мелодии
+unsigned long lastNoteTime = 0; // Время последней ноты
+const int NOTE_DURATION = 200;  // Длительность ноты в миллисекундах
+
+// Функция форматирования даты в формат DD.MM.YYYY
+String formatDateDDMMYYYY(const struct tm* timeinfo) {
+  char dateBuffer[11];  // Буфер для строки даты (10 символов + null terminator)
+  
+  // Форматирование даты: день.месяц.год
+  sprintf(dateBuffer, "%02d.%02d.%04d", 
+          timeinfo->tm_mday,          // День месяца (1-31)
+          timeinfo->tm_mon + 1,       // Месяц (0-11, поэтому +1)
+          1900 + timeinfo->tm_year);  // Год (с 1900)
+          
+  return String(dateBuffer);  // Возвращаем строку
+}
+
+// Функция перевода погодных условий с английского на русский
+String translateWeatherCondition(const String& condition) {
+  String cond = condition;
+  cond.toLowerCase();  // Приводим к нижнему регистру для сравнения
+  
+  // Сопоставление английских условий с русскими переводами
+  if (cond.indexOf("sun") >= 0 || cond.indexOf("clear") >= 0) return "Ясно";
+  if (cond.indexOf("partly cloudy") >= 0) return "Переменная облачность";
+  if (cond.indexOf("cloud") >= 0) return "Облачно";
+  if (cond.indexOf("overcast") >= 0) return "Пасмурно";
+  if (cond.indexOf("rain") >= 0) return "Дождь";
+  if (cond.indexOf("drizzle") >= 0) return "Морось";
+  if (cond.indexOf("snow") >= 0) return "Снег";
+  if (cond.indexOf("thunder") >= 0) return "Гроза";
+  if (cond.indexOf("storm") >= 0) return "Шторм";
+  if (cond.indexOf("fog") >= 0 || cond.indexOf("mist") >= 0) return "Туман";
+  if (cond.indexOf("wind") >= 0) return "Ветрено";
+  
+  return condition;  // Если перевод не найден, возвращаем оригинал
+}
+
+// Функция рисования иконки погоды
+void drawWeatherIcon(int16_t x, int16_t y, const String& condition) {
+  String cond = condition;
+  cond.toLowerCase();  // Приводим к нижнему регистру
+  
+  // Рисуем разные иконки в зависимости от погодных условий
+  if (cond.indexOf("sun") >= 0 || cond.indexOf("clear") >= 0) {
+    // Солнечно: круг с лучами
+    tft.fillCircle(x + 12, y + 12, 10, ST7735_YELLOW_LIGHT); // Солнце
+    // Лучи солнца
+    tft.fillRect(x + 12, y + 0, 2, 4, ST7735_YELLOW_LIGHT);  // Верхний
+    tft.fillRect(x + 12, y + 20, 2, 4, ST7735_YELLOW_LIGHT); // Нижний
+    tft.fillRect(x + 0, y + 12, 4, 2, ST7735_YELLOW_LIGHT);  // Левый
+    tft.fillRect(x + 20, y + 12, 4, 2, ST7735_YELLOW_LIGHT); // Правый
+  } 
+  else if (cond.indexOf("rain") >= 0 || cond.indexOf("drizzle") >= 0) {
+    // Дождь: облако с каплями
+    tft.fillCircle(x + 8, y + 6, 5, WEATHER_LIGHT_GRAY);   // Левая часть облака
+    tft.fillCircle(x + 14, y + 4, 6, WEATHER_LIGHT_GRAY);  // Центральная часть облака
+    tft.fillCircle(x + 20, y + 6, 5, WEATHER_LIGHT_GRAY);  // Правая часть облака
+    tft.fillRect(x + 8, y + 6, 12, 5, WEATHER_LIGHT_GRAY); // Нижняя часть облака
+    // Капли дождя
+    for (int i = 0; i < 3; i++) {
+      tft.drawLine(x + 10 + i*5, y + 16, x + 10 + i*5, y + 20, WEATHER_BLUE);
+    }
+  }
+  else if (cond.indexOf("snow") >= 0) {
+    // Снег: облако со снежинками
+    tft.fillCircle(x + 8, y + 6, 5, WEATHER_WHITE);   // Левая часть облака
+    tft.fillCircle(x + 14, y + 4, 6, WEATHER_WHITE);  // Центральная часть облака
+    tft.fillCircle(x + 20, y + 6, 5, WEATHER_WHITE);  // Правая часть облака
+    tft.fillRect(x + 8, y + 6, 12, 5, WEATHER_WHITE); // Нижняя часть облака
+    // Снежинки (плюсики)
+    for (int i = 0; i < 3; i++) {
+      int sx = x + 10 + i*5;
+      int sy = y + 16;
+      tft.drawPixel(sx, sy, WEATHER_WHITE);      // Центр
+      tft.drawPixel(sx+1, sy, WEATHER_WHITE);    // Право
+      tft.drawPixel(sx-1, sy, WEATHER_WHITE);    // Лево
+      tft.drawPixel(sx, sy+1, WEATHER_WHITE);    // Низ
+      tft.drawPixel(sx, sy-1, WEATHER_WHITE);    // Верх
+    }
+  }
+  else if (cond.indexOf("thunder") >= 0 || cond.indexOf("storm") >= 0) {
+    // Гроза: облако с молнией
+    tft.fillCircle(x + 8, y + 6, 5, WEATHER_DARK_GRAY);   // Левая часть облака
+    tft.fillCircle(x + 14, y + 4, 6, WEATHER_DARK_GRAY);  // Центральная часть облака
+    tft.fillCircle(x + 20, y + 6, 5, WEATHER_DARK_GRAY);  // Правая часть облака
+    tft.fillRect(x + 8, y + 6, 12, 5, WEATHER_DARK_GRAY); // Нижняя часть облака
+    // Молния
+    tft.fillTriangle(x + 12, y + 12, x + 15, y + 12, x + 12, y + 18, ST7735_YELLOW_LIGHT);
+    tft.fillTriangle(x + 15, y + 12, x + 12, y + 18, x + 15, y + 18, ST7735_YELLOW_LIGHT);
+  }
+  else if (cond.indexOf("cloud") >= 0 || cond.indexOf("overcast") >= 0) {
+    // Облачно: просто облако
+    tft.fillCircle(x + 8, y + 6, 5, WEATHER_LIGHT_GRAY);   // Левая часть облака
+    tft.fillCircle(x + 14, y + 4, 6, WEATHER_LIGHT_GRAY);  // Центральная часть облака
+    tft.fillCircle(x + 20, y + 6, 5, WEATHER_LIGHT_GRAY);  // Правая часть облака
+    tft.fillRect(x + 8, y + 6, 12, 5, WEATHER_LIGHT_GRAY); // Нижняя часть облака
+  }
+  else {
+    // По умолчанию: облако
+    tft.fillCircle(x + 8, y + 6, 5, WEATHER_LIGHT_GRAY);
+    tft.fillCircle(x + 14, y + 4, 6, WEATHER_LIGHT_GRAY);
+    tft.fillCircle(x + 20, y + 6, 5, WEATHER_LIGHT_GRAY);
+    tft.fillRect(x + 8, y + 6, 12, 5, WEATHER_LIGHT_GRAY);
+  }
+}
+
+// Функция расчета позиций для отображения времени
+void calculateTimePositions() {
+  tft.setTextSize(3);  // Устанавливаем размер текста для времени
+  tft.setFont();       // Устанавливаем стандартный шрифт
+  
+  int16_t dummyX, dummyY;  // Временные переменные для расчета размеров
+  // Получаем размеры цифры и двоеточия
+  tft.getTextBounds("8", 0, 0, &dummyX, &dummyY, &digitW, &digitH);
+  tft.getTextBounds(":", 0, 0, &dummyX, &dummyY, &colonW, &digitH);
+  
+  // Рассчитываем общую ширину времени: 6 цифр + 2 двоеточия
+  int totalTimeWidth = digitW * 6 + colonW * 2;
+  // Центрируем время по горизонтали
+  int startX = (tft.width() - totalTimeWidth) / 2;
+  // Центрируем время по вертикали
+  timeY = (tft.height() - digitH) / 2;
+  
+  // Рассчитываем X координаты для каждой позиции
+  hourTensX = startX;                     // Десятки часов
+  hourOnesX = hourTensX + digitW;         // Единицы часов
+  colon1X = hourOnesX + digitW;           // Первое двоеточие
+  minTensX = colon1X + colonW;            // Десятки минут
+  minOnesX = minTensX + digitW;           // Единицы минут
+  colon2X = minOnesX + digitW;            // Второе двоеточие
+  secTensX = colon2X + colonW;            // Десятки секунд
+  secOnesX = secTensX + digitW;           // Единицы секунд
+}
+
+// Функция расчета позиций для отображения температуры и влажности
+void calculateTempHumPositions() {
+  // Рассчитываем позиции для температуры (размер текста 3)
+  tft.setTextSize(3);
+  tft.setFont();
+  
+  int16_t dummyX, dummyY;
+  
+  // Получаем размеры для температуры
+  tft.getTextBounds("8", 0, 0, &dummyX, &dummyY, &tempDigitW, &tempDigitH);
+  tft.getTextBounds(".", 0, 0, &dummyX, &dummyY, &dotW, &tempDigitH);
+  tft.getTextBounds("C", 0, 0, &dummyX, &dummyY, &tempDigitW, &tempDigitH);
+  
+  // Рассчитываем общую ширину для температуры: XX.XC (4 цифры + точка + буква C)
+  int tempTotalWidth = tempDigitW * 4 + dotW + tempDigitW;
+  // Центрируем температуру по горизонтали
+  int tempStartX = (tft.width() - tempTotalWidth) / 2;
+  
+  // Рассчитываем X координаты для каждой позиции температуры
+  tempIntX = tempStartX;                   // Первая цифра (десятки градусов)
+  tempDec1X = tempIntX + tempDigitW;       // Вторая цифра (единицы градусов)
+  tempDotX = tempDec1X + tempDigitW;       // Точка
+  tempDec2X = tempDotX + dotW;             // Дробная часть
+  tempCX = tempDec2X + tempDigitW;         // Буква C
+  
+  // Рассчитываем позиции для влажности (размер текста 2)
+  tft.setTextSize(2);
+  tft.setFont(); // Стандартный шрифт для влажности
+  
+  // Получаем размеры для влажности
+  tft.getTextBounds("8", 0, 0, &dummyX, &dummyY, &humDigitW, &humDigitH);
+  tft.getTextBounds(".", 0, 0, &dummyX, &dummyY, &dotW, &humDigitH);
+  tft.getTextBounds("%", 0, 0, &dummyX, &dummyY, &percentW, &humDigitH);
+  
+  // Рассчитываем общую ширину для влажности: XX.X% (4 цифры + точка + знак процента)
+  int humTotalWidth = humDigitW * 4 + dotW + percentW;
+  // Центрируем влажность по горизонтали
+  int humStartX = (tft.width() - humTotalWidth) / 2;
+  
+  // Рассчитываем X координаты для каждой позиции влажности
+  humIntX1 = humStartX;                    // Первая цифра (десятки процентов)
+  humIntX2 = humIntX1 + humDigitW;         // Вторая цифра (единицы процентов)
+  humDotX = humIntX2 + humDigitW;          // Точка
+  humDecX = humDotX + dotW;                // Дробная часть
+  humPercentX = humDecX + humDigitW;       // Знак процента
+  
+  // Вертикальные позиции (разделены)
+  tempY = 40;  // Температура выше
+  humY = 90;   // Влажность ниже
+}
+
+// Функция очистки предыдущего экрана
+void clearPreviousScreen() {
+  tft.fillScreen(ST7735_BLACK);  // Заливаем экран черным цветом
+  
+  // Сбрасываем переменные отслеживания в зависимости от предыдущего экрана
+  switch(prevScreen) {
+    case 0:  // Экран времени
+      lastHour = -1;
+      lastMin = -1;
+      lastSec = -1;
+      lastDay = -1;
+      break;
+    case 1:  // Экран температуры/влажности
+      lastTemp = -100;
+      lastHum = -1;
+      currentHum = 0;
+      break;
+    case 2:  // Экран погоды
+      lastWeatherCondition = "";
+      lastShownWeatherTemp = -100;
+      break;
+  }
+}
+
+// Функция отрисовки цифры времени
+void drawDigit(int16_t x, int16_t y, char digit, uint16_t color, bool clearFirst) {
+  // Если требуется, очищаем область перед отрисовкой
+  if (clearFirst) {
+    tft.fillRect(x, y, digitW, digitH, ST7735_BLACK);
+  }
+  // Устанавливаем цвет и позицию курсора
+  tft.setTextColor(color);
+  tft.setCursor(x, y);
+  tft.print(digit);  // Рисуем цифру
+}
+
+// Функция отрисовки цифры температуры
+void drawTempDigit(int16_t x, int16_t y, char digit, uint16_t color) {
+  tft.setTextSize(3);  // Размер текста для температуры
+  tft.setFont();       // Стандартный шрифт
+  
+  // Получаем точные размеры этой цифры
+  int16_t x1, y1;
+  uint16_t w, h;
+  char digitStr[2] = {digit, '\0'};
+  tft.getTextBounds(digitStr, 0, 0, &x1, &y1, &w, &h);
+  
+  // Очищаем область для цифры
+  tft.fillRect(x, y + y1, w, h, ST7735_BLACK);
+  
+  // Рисуем цифру
+  tft.setTextColor(color);
+  tft.setCursor(x, y);
+  tft.print(digit);
+}
+
+// Функция отрисовки цифры влажности (меньший размер)
+void drawHumDigitSmall(int16_t x, int16_t y, char digit, uint16_t color) {
+  tft.setTextSize(2);  // Меньший размер текста для влажности
+  tft.setFont();       // Стандартный шрифт
+  
+  // Получаем точные размеры этой цифры
+  int16_t x1, y1;
+  uint16_t w, h;
+  char digitStr[2] = {digit, '\0'};
+  tft.getTextBounds(digitStr, 0, 0, &x1, &y1, &w, &h);
+  
+  // Очищаем область для цифры
+  tft.fillRect(x, y + y1, w, h, ST7735_BLACK);
+  
+  // Рисуем цифру
+  tft.setTextColor(color);
+  tft.setCursor(x, y);
+  tft.print(digit);
+}
+
+// Функция отрисовки символа температуры (точка, C)
+void drawTempChar(int16_t x, int16_t y, const String& ch, uint16_t color) {
+  tft.setTextSize(3);
+  tft.setFont();
+  
+  // Получаем точные размеры символа
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(ch.c_str(), 0, 0, &x1, &y1, &w, &h);
+  
+  // Очищаем область для символа
+  tft.fillRect(x, y + y1, w, h, ST7735_BLACK);
+  
+  // Рисуем символ
+  tft.setTextColor(color);
+  tft.setCursor(x, y);
+  tft.print(ch);
+}
+
+// Функция отрисовки символа влажности (точка, %)
+void drawHumCharSmall(int16_t x, int16_t y, const String& ch, uint16_t color) {
+  tft.setTextSize(2);
+  tft.setFont(); // Стандартный шрифт для влажности
+  
+  // Получаем точные размеры символа
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(ch.c_str(), 0, 0, &x1, &y1, &w, &h);
+  
+  // Очищаем область для символа
+  tft.fillRect(x, y + y1, w, h, ST7735_BLACK);
+  
+  // Рисуем символ
+  tft.setTextColor(color);
+  tft.setCursor(x, y);
+  tft.print(ch);
+}
+
+// Функция отрисовки двоеточия
+void drawColon(int16_t x, int16_t y) {
+  tft.setTextColor(ST7735_YELLOW_LIGHT);  // Желтый цвет
+  tft.setCursor(x, y);
+  tft.print(":");  // Рисуем двоеточие
+}
+
+// Функция отрисовки времени
+void drawTime(struct tm timeinfo) {
+  // Инициализируем экран времени, если это первый показ или был переключен экран
+  if (!timeScreenInitialized) {
+    if (prevScreen != currentScreen) {
+      timeScreenInitialized = true;
+      tempScreenInitialized = false;
+      weatherScreenInitialized = false;
+    }
+  }
+
+  // Форматируем время в строку
+  char timeBuf[9];
+  sprintf(timeBuf, "%02d:%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+  // Устанавливаем параметры текста
+  tft.setTextSize(3);
+  tft.setFont();
+  
+  // Если это первый показ, рисуем двоеточия
+  if (lastHour == -1) {
+    drawColon(colon1X, timeY);
+    drawColon(colon2X, timeY);
+  }
+
+  // Отрисовываем цифры времени, только если они изменились
+  // Десятки часов
+  if (timeinfo.tm_hour / 10 != lastHour / 10 || lastHour == -1) {
+    drawDigit(hourTensX, timeY, timeBuf[0], ST7735_YELLOW_LIGHT, true);
+  }
+  // Единицы часов
+  if (timeinfo.tm_hour % 10 != lastHour % 10 || lastHour == -1) {
+    drawDigit(hourOnesX, timeY, timeBuf[1], ST7735_YELLOW_LIGHT, true);
+  }
+  // Десятки минут
+  if (timeinfo.tm_min / 10 != lastMin / 10 || lastMin == -1) {
+    drawDigit(minTensX, timeY, timeBuf[3], ST7735_YELLOW_LIGHT, true);
+  }
+  // Единицы минут
+  if (timeinfo.tm_min % 10 != lastMin % 10 || lastMin == -1) {
+    drawDigit(minOnesX, timeY, timeBuf[4], ST7735_YELLOW_LIGHT, true);
+  }
+  // Десятки секунд
+  if (timeinfo.tm_sec / 10 != lastSec / 10 || lastSec == -1) {
+    drawDigit(secTensX, timeY, timeBuf[6], ST7735_YELLOW_GOLD, true);
+  }
+  // Единицы секунд
+  if (timeinfo.tm_sec % 10 != lastSec % 10 || lastSec == -1) {
+    drawDigit(secOnesX, timeY, timeBuf[7], ST7735_YELLOW_GOLD, true);
+  }
+
+  // Рисуем дату внизу экрана
+  int dateY = tft.height() - 10;  // Позиция даты
+  tft.setTextSize(1);  // Маленький размер для даты
+  
+  // Обновляем дату только если она изменилась
+  if (timeinfo.tm_mday != lastDay || lastHour == -1) {
+    lastDay = timeinfo.tm_mday;
+    // Очищаем область даты
+    tft.fillRect(0, dateY - 6, tft.width(), 8, ST7735_BLACK);
+    
+    // Форматируем дату
+    String dateStr = formatDateDDMMYYYY(&timeinfo);
+    
+    // Рассчитываем позицию для центрирования даты
+    tft.setFont();
+    int16_t x1, y1;
+    uint16_t w, h;
+    tft.getTextBounds(dateStr.c_str(), 0, 0, &x1, &y1, &w, &h);
+    int dateX = (tft.width() - w) / 2;
+    
+    // Рисуем дату
+    tft.setCursor(dateX, dateY);
+    tft.setTextColor(ST7735_YELLOW_DARK);
+    tft.print(dateStr);
+  }
+
+  // Сохраняем текущие значения времени
+  lastHour = timeinfo.tm_hour;
+  lastMin = timeinfo.tm_min;
+  lastSec = timeinfo.tm_sec;
+}
+
+// Функция отрисовки экрана температуры и влажности
+void drawTemperatureScreen(float temp, float hum) {
+  unsigned long now = millis();
+  
+  // Плавное обновление влажности с заданным интервалом
+  if (now - lastHumUpdate >= HUM_UPDATE_INTERVAL) {
+    currentHum = hum;
+    lastHumUpdate = now;
+  }
+  
+  // Инициализация экрана температуры/влажности
+  if (!tempScreenInitialized) {
+    if (prevScreen != currentScreen) {
+      tempScreenInitialized = true;
+      timeScreenInitialized = false;
+      weatherScreenInitialized = false;
+      // Сбрасываем предыдущие значения
+      lastTemp = -100;
+      lastHum = -1;
+      currentHum = hum;
+      
+      // Рисуем статические символы только один раз при инициализации
+      // Точка и C для температуры
+      drawTempChar(tempDotX, tempY, ".", ST7735_YELLOW_LIGHT);
+      drawTempChar(tempCX, tempY, "C", ST7735_YELLOW_LIGHT);
+      
+      // Точка и % для влажности
+      drawHumCharSmall(humDotX, humY, ".", ST7735_YELLOW_ORANGE);
+      drawHumCharSmall(humPercentX, humY, "%", ST7735_YELLOW_ORANGE);
+    }
+  }
+
+  // ОБНОВЛЕНИЕ ТЕМПЕРАТУРЫ (только если изменилась или при инициализации)
+  if (temp != lastTemp || !tempScreenInitialized) {
+    // Разделяем температуру на целую и дробную части
+    int tempInt = (int)temp;
+    int tempDec = (int)((temp - tempInt) * 10);
+    
+    // Всегда показываем 2 цифры для целой части (даже если первая 0)
+    if (tempInt >= 10) {
+      // Если температура больше 10, показываем обе цифры
+      drawTempDigit(tempIntX, tempY, (tempInt / 10) + '0', ST7735_YELLOW_LIGHT);
+      drawTempDigit(tempDec1X, tempY, (tempInt % 10) + '0', ST7735_YELLOW_LIGHT);
+    } else {
+      // Если температура меньше 10, первая цифра 0
+      drawTempDigit(tempIntX, tempY, '0', ST7735_YELLOW_LIGHT);
+      drawTempDigit(tempDec1X, tempY, (tempInt % 10) + '0', ST7735_YELLOW_LIGHT);
+    }
+    
+    // Дробная часть (одна цифра после точки)
+    drawTempDigit(tempDec2X, tempY, tempDec + '0', ST7735_YELLOW_LIGHT);
+    
+    lastTemp = temp;  // Сохраняем текущую температуру
+  }
+
+  // ОБНОВЛЕНИЕ ВЛАЖНОСТИ (только если изменилась или при инициализации)
+  if (currentHum != lastHum || !tempScreenInitialized) {
+    // Разделяем влажность на целую и дробную части
+    int humInt = (int)currentHum;
+    int humDec = (int)((currentHum - humInt) * 10);
+    
+    // Всегда показываем 2 цифры для целой части влажности
+    if (humInt >= 10) {
+      drawHumDigitSmall(humIntX1, humY, (humInt / 10) + '0', ST7735_YELLOW_ORANGE);
+      drawHumDigitSmall(humIntX2, humY, (humInt % 10) + '0', ST7735_YELLOW_ORANGE);
+    } else {
+      drawHumDigitSmall(humIntX1, humY, '0', ST7735_YELLOW_ORANGE);
+      drawHumDigitSmall(humIntX2, humY, (humInt % 10) + '0', ST7735_YELLOW_ORANGE);
+    }
+    
+    // Дробная часть (одна цифра после точки)
+    drawHumDigitSmall(humDecX, humY, humDec + '0', ST7735_YELLOW_ORANGE);
+    
+    lastHum = currentHum;  // Сохраняем текущую влажность
+  }
+}
+
+// Функция получения погодных данных с API
+WeatherData getWeather() {
+  WeatherData weather;
+  
+  // Проверяем подключение к WiFi
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(weatherURL);  // Начинаем HTTP запрос
+    http.setTimeout(10000);  // Устанавливаем таймаут 10 секунд
+    http.addHeader("User-Agent", "ESP32-Weather-Station");  // Добавляем заголовок User-Agent
+    
+    int httpCode = http.GET();  // Отправляем GET запрос
+    
+    if (httpCode == 200) {  // Если запрос успешен
+      String payload = http.getString();  // Получаем ответ
+      
+      // Парсим JSON
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, payload);
+      
+      if (!error) {
+        // Извлекаем данные из JSON
+        weather.temperature = doc["current"]["temp_c"];
+        weather.condition = doc["current"]["condition"]["text"].as<String>();
+        weather.valid = true;  // Помечаем данные как валидные
+      }
+    }
+    http.end();  // Завершаем соединение
+  }
+  
+  return weather;  // Возвращаем погодные данные
+}
+
+// Функция отрисовки экрана погоды
+void drawWeatherScreen(const WeatherData& weather) {
+  static String lastDisplayDesc = "";  // Для отслеживания предыдущего описания
+  
+  // Инициализация экрана погоды
+  if (!weatherScreenInitialized) {
+    if (prevScreen != currentScreen) {
+      weatherScreenInitialized = true;
+      timeScreenInitialized = false;
+      tempScreenInitialized = false;
+      lastWeatherCondition = "";
+      lastShownWeatherTemp = -100;
+      lastDisplayDesc = "";
+    }
+  }
+
+  // Если погодные данные не валидны
+  if (!weather.valid) {
+    if (lastDisplayDesc != "Нет данных") {
+      // Очищаем область и показываем сообщение об ошибке
+      tft.fillRect(0, 100, tft.width(), 10, ST7735_BLACK);
+      tft.setTextSize(2);
+      tft.setFont(&FreeMono6pt8b); // Используем кириллический шрифт
+      tft.setTextColor(ST77XX_RED);
+      tft.setCursor(20, 50);
+      tft.print("Нет данных");
+      lastDisplayDesc = "Нет данных";
+      tft.setFont();  // Возвращаем стандартный шрифт
+    }
+    return;
+  }
+
+  // Рисуем название города (Новосибирск) с кириллическим шрифтом
+  tft.setTextSize(2);
+  tft.setFont(&FreeMono6pt8b);
+  tft.setTextColor(ST7735_YELLOW_LIGHT);
+  
+  // Рассчитываем позицию для названия города
+  int16_t cityX1, cityY1;
+  uint16_t cityW, cityH;
+  tft.getTextBounds("Новосибирск", 0, 0, &cityX1, &cityY1, &cityW, &cityH);
+  int cityX = (tft.width() - cityW) / 2;  // Центрируем
+  
+  // Рисуем название города только при инициализации
+  if (!weatherScreenInitialized) {
+    tft.setCursor(cityX, 10);
+    tft.print("Новосибирск");
+  }
+
+  // Рисуем температуру и иконку погоды
+  tft.setTextSize(3);
+  String tempStr = String(weather.temperature, 1) + "C";  // Форматируем температуру
+  int16_t tempX1, tempY1;
+  uint16_t tempW, tempH;
+  tft.setFont();  // Стандартный шрифт для температуры
+  tft.getTextBounds(tempStr, 0, 0, &tempX1, &tempY1, &tempW, &tempH);
+  
+  // Рассчитываем позиции для иконки и температуры
+  int totalBlockWidth = 25 + tempW + 10;  // 25px иконка + ширина температуры + отступ
+  int blockStartX = (tft.width() - totalBlockWidth) / 2;  // Центрируем блок
+  int iconX = blockStartX;                // X иконки
+  int iconY = 45;                         // Y иконки
+  int tempX = blockStartX + 25 + 10;      // X температуры (иконка + отступ)
+  int tempY_local = 50;                   // Y температуры
+
+  // Обновляем иконку и температуру только если они изменились
+  if (weather.condition != lastWeatherCondition || 
+      weather.temperature != lastShownWeatherTemp || 
+      !weatherScreenInitialized) {
+    
+    // Очищаем области иконки и температуры
+    tft.fillRect(iconX, iconY, 25, 25, ST7735_BLACK);
+    tft.fillRect(tempX, tempY_local, tempW, tempH, ST7735_BLACK);
+    
+    // Рисуем иконку погоды
+    drawWeatherIcon(iconX, iconY, weather.condition);
+    
+    // Рисуем температуру
+    tft.setTextSize(3);
+    tft.setTextColor(ST7735_YELLOW_GOLD);
+    tft.setCursor(tempX, tempY_local);
+    tft.print(tempStr);
+    
+    // Сохраняем текущие значения
+    lastWeatherCondition = weather.condition;
+    lastShownWeatherTemp = weather.temperature;
+  }
+
+  // Рисуем описание погоды с кириллическим шрифтом
+  tft.setTextSize(1);
+  tft.setFont(&FreeMono6pt8b);
+  tft.setTextColor(ST7735_YELLOW_ORANGE);
+  
+  // Переводим описание на русский и обрезаем если слишком длинное
+  String displayDesc = translateWeatherCondition(weather.condition);
+  if (displayDesc.length() > 20) {
+    displayDesc = displayDesc.substring(0, 20);
+  }
+  
+  // Обновляем описание только если оно изменилось
+  if (displayDesc != lastDisplayDesc || !weatherScreenInitialized) {
+    // Очищаем область описания
+    tft.fillRect(0, 100, tft.width(), 10, ST7735_BLACK);
+    
+    // Рассчитываем позицию для описания
+    int16_t descX1, descY1;
+    uint16_t descW, descH;
+    tft.getTextBounds(displayDesc.c_str(), 0, 0, &descX1, &descY1, &descW, &descH);
+    int descX = (tft.width() - descW) / 2;  // Центрируем
+    
+    // Рисуем описание
+    tft.setCursor(descX, 100);
+    tft.print(displayDesc);
+    
+    lastDisplayDesc = displayDesc;  // Сохраняем текущее описание
+  }
+  
+  tft.setFont();  // Возвращаем стандартный шрифт
+}
+
+// Функция воспроизведения мелодии будильника
+void playAlarmMelody() {
+  unsigned long currentTime = millis();
+  
+  // Воспроизводим следующую ноту, если прошло достаточно времени
+  if (currentTime - lastNoteTime >= NOTE_DURATION) {
+    tone(BUZZER_PIN, ALARM_MELODY[melodyIndex]);  // Воспроизводим ноту на зуммере
+    melodyIndex = (melodyIndex + 1) % MELODY_LENGTH;  // Переходим к следующей ноте
+    lastNoteTime = currentTime;  // Обновляем время последней ноты
+  }
+}
+
+// Функция остановки звука будильника
+void stopAlarmSound() {
+  noTone(BUZZER_PIN);  // Выключаем звук зуммера
+  melodyIndex = 0;     // Сбрасываем индекс мелодии
+  isBuzzerActive = false;  // Помечаем зуммер как неактивный
+}
+
+// Функция управления зуммером
+void controlBuzzer() {
+  if (isBuzzerActive) {
+    unsigned long currentTime = millis();
+    
+    // Если прошло время длительности будильника, останавливаем его
+    if (currentTime - buzzerStartTime >= alarmDuration * 1000) {
+      stopAlarmSound();
+      showingAlarm = false;  // Скрываем уведомление
+      
+      // Сбрасываем флаги инициализации экранов для перерисовки
+      if (currentScreen == 0) timeScreenInitialized = false;
+      if (currentScreen == 1) tempScreenInitialized = false;
+      if (currentScreen == 2) weatherScreenInitialized = false;
+    } else {
+      // Иначе продолжаем воспроизводить мелодию
+      playAlarmMelody();
+    }
+  }
+}
+
+// Функция отрисовки оверлея будильника
+void drawAlarmOverlay() {
+  // Рисуем прямоугольник для оверлея
+  int overlayHeight = 16;
+  int overlayY = 92;
+  tft.fillRect(10, overlayY, tft.width() - 20, overlayHeight, ST7735_YELLOW_GOLD);
+  
+  // Настраиваем шрифт для текста
+  tft.setFont(&FreeMono6pt8b); // Кириллический шрифт
+  tft.setTextColor(ST77XX_BLACK);  // Черный текст на желтом фоне
+  tft.setTextSize(1);
+  
+  // Формируем текст будильника
+  String alarmText = "БУДИЛЬНИК " + String(alarmHour) + ":" + (alarmMinute < 10 ? "0" : "") + String(alarmMinute);
+  
+  // Рассчитываем позицию для центрирования текста
+  int16_t x1, y1;
+  uint16_t w, h;
+  tft.getTextBounds(alarmText, 0, 0, &x1, &y1, &w, &h);
+  
+  // Центрируем текст в прямоугольнике
+  int textY = overlayY + overlayHeight/2 - h/2 - y1;
+  int textX = (tft.width() - w) / 2;
+  
+  // Рисуем текст
+  tft.setCursor(textX, textY);
+  tft.print(alarmText);
+  tft.setFont();  // Возвращаем стандартный шрифт
+}
+
+// Функция проверки срабатывания будильника
+void checkAlarm(struct tm timeinfo) {
+  static bool wasTriggeredThisMinute = false;  // Чтобы не срабатывать несколько раз в одну минуту
+  static int lastCheckedMin = -1;  // Последняя проверенная минута
+  
+  if (!alarmEnabled) return;  // Если будильник выключен
+  
+  // Обновляем последнюю проверенную минуту
+  if (lastCheckedMin != timeinfo.tm_min) {
+    lastCheckedMin = timeinfo.tm_min;
+  }
+  
+  // Проверяем, совпадает ли текущее время с временем будильника
+  if (timeinfo.tm_hour == alarmHour && 
+      timeinfo.tm_min == alarmMinute && 
+      !wasTriggeredThisMinute) 
+  {
+    // Запускаем будильник
+    isBuzzerActive = true;
+    buzzerStartTime = millis();
+    showingAlarm = true;
+    alarmDisplayStart = millis();
+  }
+  
+  // Если минута изменилась (будильник должен перестать срабатывать)
+  if (timeinfo.tm_min != alarmMinute) {
+    wasTriggeredThisMinute = false;
+    if (showingAlarm) {
+      showingAlarm = false;
+    }
+    // Если зуммер активен, останавливаем его
+    if (isBuzzerActive) {
+      stopAlarmSound();
+      // Сбрасываем флаги инициализации экранов
+      if (currentScreen == 0) timeScreenInitialized = false;
+      if (currentScreen == 1) tempScreenInitialized = false;
+      if (currentScreen == 2) weatherScreenInitialized = false;
+    }
+  }
+  
+  // Отмечаем, что в эту минуту будильник уже сработал
+  if (timeinfo.tm_min == alarmMinute && timeinfo.tm_hour == alarmHour) {
+    wasTriggeredThisMinute = true;
+  }
+}
+
+// Функция генерации HTML страницы для веб-интерфейса
+String htmlPage() {
+  String page;
+  
+  // Начало HTML документа
+  page += "<!DOCTYPE html><html><head>";
+  page += "<meta charset='UTF-8'>";  // Кодировка UTF-8 для русских символов
+  page += "<meta name='viewport' content='width=device-width,initial-scale=1'>";  // Для мобильных устройств
+  page += "<title>Настройки будильника</title>";  // Заголовок страницы
+  
+  // CSS стили
+  page += "<style>";
+  page += "* { margin: 0; padding: 0; box-sizing: border-box; }";
+  page += "body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a1a; color: #ffcc00; }";
+  page += ".container { max-width: 500px; margin: 20px auto; padding: 20px; background: #2a2a2a; border-radius: 10px; }";
+  page += "h2 { text-align: center; margin-bottom: 20px; color: #ffcc00; border-bottom: 2px solid #ffcc00; padding-bottom: 10px; }";
+  page += ".status { background: #333; padding: 15px; border-radius: 8px; margin-bottom: 20px; text-align: center; font-size: 18px; border: 1px solid #ffcc00; }";
+  page += ".form-group { margin-bottom: 15px; }";
+  page += "label { display: block; margin-bottom: 5px; color: #ffcc00; font-weight: bold; }";
+  page += "input[type='number'], select { width: 100%; padding: 10px; border: 1px solid #ffcc00; border-radius: 5px; background: #333; color: #ffcc00; font-size: 16px; }";
+  page += ".checkbox { display: flex; align-items: center; margin: 15px 0; }";
+  page += ".checkbox input { margin-right: 10px; width: 20px; height: 20px; }";
+  page += ".buttons { display: flex; gap: 10px; margin-top: 20px; }";
+  page += "button, input[type='submit'] { flex: 1; padding: 12px; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; transition: all 0.3s; }";
+  page += "input[type='submit'] { background: #ffcc00; color: #1a1a1a; font-weight: bold; }";
+  page += "button.test { background: #333; color: #ffcc00; border: 1px solid #ffcc00; }";
+  page += "input[type='submit']:hover { background: #ffd633; }";
+  page += "button.test:hover { background: #444; }";
+  page += ".info { margin-top: 20px; padding: 10px; background: #333; border-radius: 5px; text-align: center; font-size: 14px; }";
+  page += "</style>";
+  
+  // JavaScript для тестирования зуммера
+  page += "<script>";
+  page += "function testBuzzer() {";
+  page += "  let dur = document.querySelector('select[name=\"duration\"]').value;";
+  page += "  fetch('/test?dur=' + dur).then(r => r.text()).then(t => alert('Тестирую зуммер в течение ' + dur + ' секунд...'));";
+  page += "}";
+  page += "</script>";
+  page += "</head><body>";
+  
+  // Тело страницы
+  page += "<div class='container'>";
+  page += "<h2>Настройки будильника</h2>";
+  
+  // Статусная панель
+  page += "<div class='status'>";
+  page += "Текущий будильник: <strong>" + String(alarmHour) + ":" + (alarmMinute < 10 ? "0" : "") + String(alarmMinute) + "</strong><br>";
+  page += "Состояние: " + String(alarmEnabled ? "<span style='color:#4CAF50'>ВКЛЮЧЕН</span>" : "<span style='color:#f44336'>ВЫКЛЮЧЕН</span>");
+  page += "<br>Длительность: " + String(alarmDuration) + " секунд";
+  page += "</div>";
+  
+  // Форма настроек
+  page += "<form method='POST'>";
+  
+  // Поле для часа
+  page += "<div class='form-group'>";
+  page += "<label>Час (0-23)</label>";
+  page += "<input name='hour' type='number' min='0' max='23' value='" + String(alarmHour) + "' required>";
+  page += "</div>";
+  
+  // Поле для минуты
+  page += "<div class='form-group'>";
+  page += "<label>Минута (0-59)</label>";
+  page += "<input name='min' type='number' min='0' max='59' value='" + String(alarmMinute) + "' required>";
+  page += "</div>";
+  
+  // Выбор длительности
+  page += "<div class='form-group'>";
+  page += "<label>Длительность</label>";
+  page += "<select name='duration'>";
+  page += "<option value='5'" + String(alarmDuration == 5 ? " selected" : "") + ">5 секунд</option>";
+  page += "<option value='7'" + String(alarmDuration == 7 ? " selected" : "") + ">7 секунд</option>";
+  page += "<option value='10'" + String(alarmDuration == 10 ? " selected" : "") + ">10 секунд</option>";
+  page += "<option value='15'" + String(alarmDuration == 15 ? " selected" : "") + ">15 секунд</option>";
+  page += "</select>";
+  page += "</div>";
+  
+  // Чекбокс включения/выключения
+  page += "<div class='checkbox'>";
+  page += "<input type='checkbox' name='enable' id='enable' " + String(alarmEnabled ? "checked" : "") + ">";
+  page += "<label for='enable'>Включить будильник</label>";
+  page += "</div>";
+  
+  // Кнопки
+  page += "<div class='buttons'>";
+  page += "<input type='submit' value='Сохранить настройки'>";
+  page += "<button type='button' class='test' onclick='testBuzzer()'>Тест зуммера</button>";
+  page += "</div>";
+  page += "</form>";
+  
+  // Информация об IP адресе
+  page += "<div class='info'>";
+  page += "IP устройства: " + WiFi.localIP().toString();
+  page += "</div>";
+  
+  page += "</div>";
+  page += "</body></html>";
+  
+  return page;
+}
+
+// Обработчик для тестирования зуммера
+void handleTest() {
+  int testDuration = 3;  // Длительность по умолчанию
+  
+  // Получаем длительность из параметра запроса
+  if (server.hasArg("dur")) {
+    testDuration = server.arg("dur").toInt();
+  }
+  
+  // Проигрываем тестовую мелодию
+  for (int i = 0; i < MELODY_LENGTH; i++) {
+    tone(BUZZER_PIN, ALARM_MELODY[i]);
+    delay(200);
+  }
+  noTone(BUZZER_PIN);  // Выключаем зуммер
+  
+  // Отправляем ответ
+  server.send(200, "text/plain", "Зуммер протестирован в течение " + String(testDuration) + " секунд");
+}
+
+// Обработчик корневой страницы веб-сервера
+void handleRoot() {
+  // Если получен POST запрос (сохранение настроек)
+  if (server.method() == HTTP_POST) {
+    // Получаем параметры из формы
+    if (server.hasArg("hour")) alarmHour = server.arg("hour").toInt();
+    if (server.hasArg("min")) alarmMinute = server.arg("min").toInt();
+    if (server.hasArg("duration")) alarmDuration = server.arg("duration").toInt();
+    alarmEnabled = server.hasArg("enable");  // Чекбокс - есть аргумент если включен
+    
+    // Сохраняем настройки в энергонезависимую память
+    prefs.putInt("hour", alarmHour);
+    prefs.putInt("min", alarmMinute);
+    prefs.putInt("duration", alarmDuration);
+    prefs.putBool("enabled", alarmEnabled);
+  }
+  
+  // Отправляем HTML страницу
+  server.send(200, "text/html", htmlPage());
+}
+
+// Функция setup() - выполняется один раз при старте
+void setup() {
+  Serial.begin(115200);  // Инициализация Serial порта для отладки
+  
+  // Инициализация дисплея
+  tft.initR(INITR_BLACKTAB);  // Инициализация с параметрами для черной вкладки
+  tft.setRotation(1);         // Поворот дисплея (ориентация)
+  tft.fillScreen(ST7735_BLACK);  // Очистка экрана черным цветом
+  
+  // Настройка пина зуммера
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);  // Гарантируем выключение зуммера
+  
+  // Отображение сообщения о подключении к WiFi
+  tft.setFont(&FreeMono6pt8b);  // Кириллический шрифт
+  tft.setTextColor(ST7735_YELLOW_LIGHT);
+  tft.setCursor(2, 10);
+  tft.print("Подключение к WiFi...");
+  
+  // Подключение к WiFi
+  WiFi.begin(ssid, password);
+  // Ожидание подключения
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+  }
+  
+  // Отображение информации о подключении
+  tft.fillScreen(ST7735_BLACK);
+  tft.setCursor(2, 10);
+  tft.print("WiFi подключен!");
+  tft.setCursor(2, 30);
+  tft.print("IP: ");
+  tft.print(WiFi.localIP());  // Вывод IP адреса
+  tft.setFont();  // Возвращаем стандартный шрифт
+  delay(2000);    // Задержка для чтения информации
+  
+  // Настройка NTP для получения времени
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+  delay(1000);  // Задержка для получения времени
+  
+  // Инициализация датчика DHT
+  dht.begin();
+  
+  // Расчет позиций для отображения
+  calculateTimePositions();
+  calculateTempHumPositions();
+  
+  // Начальная инициализация экрана
+  tft.fillScreen(ST7735_BLACK);
+  lastSwitch = millis();
+  timeScreenInitialized = false;
+  
+  // Загрузка сохраненных настроек будильника
+  prefs.begin("alarm", false);  // Открываем пространство имен "alarm"
+  alarmHour = prefs.getInt("hour", 20);        // По умолчанию 20:00
+  alarmMinute = prefs.getInt("min", 30);       // По умолчанию 20:30
+  alarmDuration = prefs.getInt("duration", 7); // По умолчанию 7 секунд
+  alarmEnabled = prefs.getBool("enabled", true); // По умолчанию включен
+  
+  // Настройка веб-сервера
+  server.on("/", handleRoot);   // Корневая страница
+  server.on("/test", handleTest); // Страница тестирования зуммера
+  server.begin();  // Запуск веб-сервера
+}
+
+// Функция loop() - выполняется циклически
+void loop() {
+  unsigned long now = millis();  // Текущее время в миллисекундах
+  
+  // Обработка клиентов веб-сервера
+  server.handleClient();
+  
+  // Переключение экранов по таймеру
+  if (now - lastSwitch >= SCREEN_DURATION) {
+    prevScreen = currentScreen;           // Сохраняем предыдущий экран
+    currentScreen = (currentScreen + 1) % 3;  // Переключаем на следующий экран (0→1→2→0)
+    lastSwitch = now;                     // Обновляем время последнего переключения
+    clearPreviousScreen();                // Очищаем предыдущий экран
+    
+    // Сбрасываем флаги инициализации
+    timeScreenInitialized = false;
+    tempScreenInitialized = false;
+    weatherScreenInitialized = false;
+  }
+  
+  // Обновление погодных данных по таймеру
+  if (now - lastWeatherUpdate >= WEATHER_UPDATE_INTERVAL || lastWeatherUpdate == 0) {
+    lastWeather = getWeather();          // Получаем новые данные
+    lastWeatherUpdate = now;             // Обновляем время последнего запроса
+  }
+  
+  // Получение текущего времени
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    delay(200);  // Если время не получено, ждем и пробуем снова
+    return;
+  }
+  
+  // Проверка и управление будильником
+  checkAlarm(timeinfo);   // Проверяем, не пора ли сработать будильнику
+  controlBuzzer();        // Управляем зуммером если будильник активен
+  
+  // Отображение информации на дисплее
+  if (showingAlarm) {
+    // Если показывается уведомление о будильнике
+    
+    // Сначала рисуем основной экран
+    switch (currentScreen) {
+      case 0:  // Экран времени
+        drawTime(timeinfo);
+        break;
+      case 1:  // Экран температуры/влажности
+        {
+          // Чтение данных с датчика DHT
+          float temp = dht.readTemperature();
+          float hum = dht.readHumidity();
+          
+          if (!isnan(temp) && !isnan(hum)) {
+            // Если данные корректные, рисуем экран температуры
+            drawTemperatureScreen(temp, hum);
+          } else {
+            // Если ошибка датчика
+            if (!tempScreenInitialized) {
+              tft.fillRect(20, 50, tft.width() - 40, 20, ST7735_BLACK);
+              tft.setTextSize(2);
+              tft.setFont(&FreeMono6pt8b);
+              tft.setTextColor(ST77XX_RED);
+              tft.setCursor(20, 50);
+              tft.print("Ошибка датчика");
+              tft.setFont();
+              tempScreenInitialized = true;
+            }
+          }
+        }
+        break;
+      case 2:  // Экран погоды
+        drawWeatherScreen(lastWeather);
+        break;
+    }
+    
+    // Поверх основного экрана рисуем оверлей будильника
+    drawAlarmOverlay();
+    
+  } else {
+    // Если будильник не активен, просто рисуем текущий экран
+    switch (currentScreen) {
+      case 0:  // Экран времени
+        drawTime(timeinfo);
+        break;
+      case 1:  // Экран температуры/влажности
+        {
+          float temp = dht.readTemperature();
+          float hum = dht.readHumidity();
+          
+          if (!isnan(temp) && !isnan(hum)) {
+            drawTemperatureScreen(temp, hum);
+          } else {
+            if (!tempScreenInitialized) {
+              tft.fillRect(20, 50, tft.width() - 40, 20, ST7735_BLACK);
+              tft.setTextSize(2);
+              tft.setFont(&FreeMono6pt8b);
+              tft.setTextColor(ST77XX_RED);
+              tft.setCursor(20, 50);
+              tft.print("Ошибка датчика");
+              tft.setFont();
+              tempScreenInitialized = true;
+            }
+          }
+        }
+        break;
+      case 2:  // Экран погоды
+        drawWeatherScreen(lastWeather);
+        break;
+    }
+  }
+  
+  delay(50);  // Небольшая задержка для стабильности работы
+}
